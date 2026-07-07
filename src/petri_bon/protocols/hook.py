@@ -138,6 +138,18 @@ def bon_generate(
                     try:
                         await scorer.score(ctx, cand)
                     except Exception as e:
+                        # Auth/permission errors will never succeed on retry;
+                        # failing loudly beats silently scoring every
+                        # candidate 0.5 for the whole run.
+                        status = getattr(e, "status_code", None)
+                        if status in (400, 401, 403):
+                            raise RuntimeError(
+                                f"Preference scoring failed permanently "
+                                f"(HTTP {status}): {e}. For selector=logprob "
+                                f"this usually means the API key lacks the "
+                                f"probabilities-2024-07-31 beta (set "
+                                f"ANTHROPIC_API_KEY_LP), or the key is invalid."
+                            ) from e
                         logger.error("Scoring error (turn %d): %s", turn, e)
                         cand.score = 0.5
             return cand
