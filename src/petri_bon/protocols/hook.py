@@ -112,6 +112,7 @@ def bon_generate(
             target_tools=list(state.tools),
             tools=tools,
             cache=cache,
+            auditor_model=model,
         )
 
         async def draft(index: int) -> Candidate:

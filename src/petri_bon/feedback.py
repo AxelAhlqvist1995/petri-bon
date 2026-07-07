@@ -15,7 +15,7 @@ from inspect_ai.model import (
 
 from .prompts.loader import load_prompt, resolve_prompt
 from .rendering import render_last_action
-from .types import Candidate, TurnContext, format_preference_band
+from .types import Candidate, TurnContext, format_preference_band, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -82,13 +82,6 @@ class DefaultFeedbackModel:
         self.single_turn = single_turn
         self.max_tokens = max_tokens
 
-    def _get_model(self) -> Model:
-        from inspect_ai.model import get_model
-
-        if self.model is not None and not isinstance(self.model, str):
-            return self.model  # Model instance or duck-typed equivalent
-        return get_model(self.model, role="feedback")
-
     def _format_prompt(self, ctx: TurnContext, candidate: Candidate) -> str:
         kwargs: dict[str, str] = {
             "preference_score": self.score_formatter(candidate.score),
@@ -124,7 +117,7 @@ class DefaultFeedbackModel:
             )
 
         prompt_text = self._format_prompt(ctx, candidate)
-        model = self._get_model()
+        model = resolve_model(self.model, "feedback", ctx)
         config = GenerateConfig(max_tokens=self.max_tokens, cache_prompt=True)
         try:
             if self.single_turn:

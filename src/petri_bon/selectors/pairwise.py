@@ -17,7 +17,7 @@ from inspect_ai.model import ChatMessageUser, GenerateConfig, Model
 
 from ..prompts.loader import resolve_prompt
 from ..rendering import render_target_transcript
-from ..types import Candidate, TurnContext
+from ..types import Candidate, TurnContext, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +64,6 @@ class PairwiseSelector:
         self.preference_prompt = resolve_prompt("preference/pairwise", preference_prompt)
         self.max_tokens = max_tokens
 
-    def _get_model(self) -> Model:
-        from inspect_ai.model import get_model
-
-        if self.model is not None and not isinstance(self.model, str):
-            return self.model  # Model instance or duck-typed equivalent
-        return get_model(self.model, role="preference")
-
     def format_match_prompt(
         self, ctx: TurnContext, cand_a: Candidate, cand_b: Candidate, swap: bool
     ) -> str:
@@ -112,7 +105,7 @@ class PairwiseSelector:
         swap = random.Random(f"{ctx.turn}:{round_no}:{a}:{b}").random() < 0.5
         prompt = self.format_match_prompt(ctx, cand_a, cand_b, swap)
 
-        model = self._get_model()
+        model = resolve_model(self.model, "preference", ctx)
         try:
             output = await model.generate(
                 [ChatMessageUser(content=prompt)],

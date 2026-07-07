@@ -14,7 +14,7 @@ from inspect_ai.model import ChatMessageUser, GenerateConfig, Model
 
 from ..prompts.loader import resolve_prompt
 from ..rendering import render_target_transcript, target_visible_calls
-from ..types import UNSCORABLE_SENTINEL, Candidate, TurnContext
+from ..types import UNSCORABLE_SENTINEL, Candidate, TurnContext, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +34,6 @@ class TextScoreScorer:
         self.preference_prompt = resolve_prompt("preference/score", preference_prompt)
         self.max_tokens = max_tokens
 
-    def _get_model(self) -> Model:
-        from inspect_ai.model import get_model
-
-        if self.model is not None and not isinstance(self.model, str):
-            return self.model  # Model instance or duck-typed equivalent
-        return get_model(self.model, role="preference")
-
     def format_prompt(self, ctx: TurnContext, candidate: Candidate) -> str:
         transcript = render_target_transcript(ctx.target_messages, candidate.message)
         return self.preference_prompt.format(transcript=transcript)
@@ -53,7 +46,7 @@ class TextScoreScorer:
         prompt = self.format_prompt(ctx, candidate)
         candidate.details["preference_prompt"] = prompt
 
-        model = self._get_model()
+        model = resolve_model(self.model, "preference", ctx)
         output = await model.generate(
             [ChatMessageUser(content=prompt)],
             config=GenerateConfig(max_tokens=self.max_tokens, cache_prompt=True),

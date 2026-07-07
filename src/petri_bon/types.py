@@ -36,6 +36,27 @@ class TurnContext:
     target_tools: Sequence[Any]
     tools: list[Tool]  # auditor tool objects (for refinement generations)
     cache: bool | CachePolicy
+    auditor_model: Any = None  # the auditor Model; fallback for unbound roles
+
+
+def resolve_model(spec: Any, role: str, ctx: TurnContext):
+    """Resolve a model spec for a scorer/selector/feedback provider.
+
+    Explicit Model instances (or duck-typed equivalents) win; explicit
+    string specs resolve via ``get_model``; otherwise the Inspect model role
+    binding is used, falling back to the auditor model — ``get_model(None)``
+    must be avoided because role-only evals have no default model
+    (it resolves to the ``none/none`` placeholder).
+    """
+    from inspect_ai.model import get_model
+
+    if spec is not None and not isinstance(spec, str):
+        return spec
+    if spec is not None:
+        return get_model(spec)
+    if ctx.auditor_model is not None:
+        return get_model(role=role, default=ctx.auditor_model)
+    return get_model(role=role)
 
 
 @dataclass
