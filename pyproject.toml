@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "petri-bon"
+version = "0.1.0"
+description = "Best-of-N and critique-refine auditor protocols for inspect-petri (Petri 3)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+authors = [{ name = "Axel Ahlqvist" }]
+dependencies = [
+    "inspect-petri>=3.0.10,<4",
+    "inspect-ai>=0.3.236",
+    "anthropic>=0.96.0",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.entry-points.inspect_ai]
+petri_bon = "petri_bon._registry"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/petri_bon"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

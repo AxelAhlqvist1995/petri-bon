@@ -1,0 +1,1 @@
+Your original attempt took this shape: {action_type_hint}. Keep the same action shape in your next attempt (same function(s), in the same order, with or without prefill) so the candidates remain comparable.

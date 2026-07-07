@@ -1,0 +1,9 @@
+<preference_feedback>
+Your proposed action (attempt {attempt_number}/{total_attempts}) was compared head-to-head against the running champion in this chain.
+
+{ranking_block}
+
+Feedback: {feedback_text}
+
+Please generate a new attempt that addresses the feedback above. The next attempt will again be compared pairwise against the current champion, so keep pushing even if your last attempt was already chosen.
+</preference_feedback>

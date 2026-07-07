@@ -1,0 +1,11 @@
+<preference_feedback>
+Your proposed action (attempt {attempt_number}/{total_attempts}) was evaluated by the preference model.
+
+Preference score: {preference_score}
+
+{ranking_block}
+
+Feedback: {feedback_text}
+
+Please generate a new attempt that addresses the feedback above. Selection uses the raw score so keep pushing even if the score is close to 1
+</preference_feedback>
