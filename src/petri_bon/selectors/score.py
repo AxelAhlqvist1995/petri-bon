@@ -13,7 +13,12 @@ import re
 from inspect_ai.model import ChatMessageUser, GenerateConfig, Model
 
 from ..prompts.loader import resolve_prompt
-from ..rendering import render_target_transcript, target_visible_calls
+from ..rendering import (
+    render_target_transcript,
+    split_at_shared_prefix,
+    target_visible_calls,
+    two_block_user_message,
+)
 from ..types import UNSCORABLE_SENTINEL, Candidate, TurnContext, resolve_model
 
 logger = logging.getLogger(__name__)
@@ -43,12 +48,25 @@ class TextScoreScorer:
             candidate.score = UNSCORABLE_SENTINEL
             return
 
-        prompt = self.format_prompt(ctx, candidate)
+        transcript = render_target_transcript(ctx.target_messages, candidate.message)
+        prompt = self.preference_prompt.format(transcript=transcript)
         candidate.details["preference_prompt"] = prompt
+
+        # Two-block cache packaging: split at the end of the shared
+        # conversation (the transcript without the candidate's staged
+        # effects) so same-turn scoring calls cache-read that prefix instead
+        # of each cache-writing the whole prompt. Rendered text unchanged.
+        shared = render_target_transcript(ctx.target_messages, None)
+        split = split_at_shared_prefix(prompt, transcript, shared)
+        message = (
+            two_block_user_message(*split)
+            if split is not None
+            else ChatMessageUser(content=prompt)
+        )
 
         model = resolve_model(self.model, "preference", ctx)
         output = await model.generate(
-            [ChatMessageUser(content=prompt)],
+            [message],
             config=GenerateConfig(max_tokens=self.max_tokens, cache_prompt=True),
         )
         text = output.completion or ""

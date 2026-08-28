@@ -19,6 +19,7 @@ from inspect_ai.model import (
     ChatMessageSystem,
     ChatMessageTool,
     ChatMessageUser,
+    ContentText,
 )
 
 from .types import TARGET_VISIBLE_FUNCTIONS
@@ -113,6 +114,54 @@ def render_target_transcript(
 ) -> str:
     """Target-visible transcript including the candidate's staged effects."""
     return render_conversation(apply_candidate_effects(target_messages, candidate))
+
+
+def two_block_user_message(block1: str, block2: str) -> ChatMessageUser:
+    """Package a user prompt as two text content blocks for prompt caching.
+
+    ``block1`` is the prefix that is stable across the calls of a batch
+    (prompt intro + shared conversation context); ``block2`` is the
+    call-specific tail. The model receives the exact concatenation
+    ``block1 + block2`` — providers inject no separator between text blocks
+    (verified for Anthropic via count_tokens: a mid-word split re-fuses into
+    the same tokens as the single string). With ``cache_prompt=True``
+    Inspect's Anthropic provider marks the second-to-last content block
+    (``block1``) with a ``cache_control`` breakpoint, so same-batch calls
+    cache-read the stable prefix and only write their small tails. Either
+    block empty falls back to a plain single-string message.
+    """
+    if not block1 or not block2:
+        return ChatMessageUser(content=block1 + block2)
+    return ChatMessageUser(content=[ContentText(text=block1), ContentText(text=block2)])
+
+
+def split_at_shared_prefix(
+    text: str,
+    embedded: str | None,
+    shared_prefix: str | None,
+) -> tuple[str, str] | None:
+    """Split ``text`` at the end of ``shared_prefix`` inside the embedded
+    transcript, for two-block cache packaging.
+
+    ``embedded`` is the transcript substituted into ``text`` (used to locate
+    the split precisely); ``shared_prefix`` is the portion of it that is
+    stable across the batch (the rendered conversation without the
+    candidate's staged effects). Returns ``(block1, block2)`` with
+    ``block1 + block2 == text`` exactly, or ``None`` when no valid split
+    exists (empty prefix, a ``set_system_message`` candidate rewrote the
+    conversation start, or the prefix is not found verbatim).
+    """
+    if not shared_prefix or not text:
+        return None
+    if embedded and embedded.startswith(shared_prefix):
+        idx = text.find(embedded)
+        cut = idx + len(shared_prefix) if idx >= 0 else -1
+    else:
+        idx = text.find(shared_prefix)
+        cut = idx + len(shared_prefix) if idx >= 0 else -1
+    if cut <= 0 or cut >= len(text):
+        return None
+    return text[:cut], text[cut:]
 
 
 def render_last_action(candidate: ChatMessageAssistant | None) -> str:

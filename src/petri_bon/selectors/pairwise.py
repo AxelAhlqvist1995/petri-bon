@@ -8,16 +8,21 @@ through Inspect's ``get_model`` so any provider works.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import random
 import re
 
-from inspect_ai.model import ChatMessageUser, GenerateConfig, Model
+from inspect_ai.model import GenerateConfig, Model
 
 from ..prompts.loader import resolve_prompt
-from ..rendering import render_target_transcript
-from ..types import Candidate, TurnContext, resolve_model
+from ..rendering import render_target_transcript, two_block_user_message
+from ..types import (
+    Candidate,
+    TurnContext,
+    gather_warm_first,
+    is_anthropic_model,
+    resolve_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +67,24 @@ class PairwiseSelector:
     ):
         self.model = model
         self.preference_prompt = resolve_prompt("preference/pairwise", preference_prompt)
+        if "{transcripts}" not in self.preference_prompt:
+            raise ValueError(
+                "Pairwise preference prompt must contain a {transcripts} slot."
+            )
         self.max_tokens = max_tokens
 
-    def format_match_prompt(
+    def format_match_blocks(
         self, ctx: TurnContext, cand_a: Candidate, cand_b: Candidate, swap: bool
-    ) -> str:
+    ) -> tuple[str, str]:
+        """Build the match prompt as (stable block, variable block).
+
+        Block 1 (prompt intro + shared context) is stable across the matches
+        of a turn and carries the Anthropic cache breakpoint via
+        ``cache_prompt=True``; block 2 (the two continuations + instructions,
+        where the A/B swap lives) varies per match and stays out of the cache
+        key. The rendered prompt is the exact concatenation of the blocks —
+        byte-identical to the previous single-string prompt.
+        """
         text_a = cand_a.details.get("transcript") or render_target_transcript(
             ctx.target_messages, cand_a.message
         )
@@ -76,12 +94,19 @@ class PairwiseSelector:
         if swap:
             text_a, text_b = text_b, text_a
         shared, cont_0, cont_1 = shared_prefix_split(text_a, text_b)
-        transcripts = (
-            f"<shared_context>\n{shared}\n</shared_context>\n\n"
+        before, _, after = self.preference_prompt.partition("{transcripts}")
+        block1 = f"{before}<shared_context>\n{shared}\n</shared_context>\n\n"
+        block2 = (
             f"<continuation_0>\n{cont_0}\n</continuation_0>\n\n"
-            f"<continuation_1>\n{cont_1}\n</continuation_1>"
+            f"<continuation_1>\n{cont_1}\n</continuation_1>{after}"
         )
-        return self.preference_prompt.format(transcripts=transcripts)
+        return block1, block2
+
+    def format_match_prompt(
+        self, ctx: TurnContext, cand_a: Candidate, cand_b: Candidate, swap: bool
+    ) -> str:
+        block1, block2 = self.format_match_blocks(ctx, cand_a, cand_b, swap)
+        return block1 + block2
 
     async def _play_match(
         self,
@@ -90,6 +115,7 @@ class PairwiseSelector:
         a: int,
         b: int,
         round_no: int,
+        model: Model,
     ) -> int:
         cand_a, cand_b = candidates[a], candidates[b]
         # Structural short-circuit: an invalid candidate never advances over a
@@ -103,12 +129,11 @@ class PairwiseSelector:
 
         # Deterministic A/B position swap to wash out position bias.
         swap = random.Random(f"{ctx.turn}:{round_no}:{a}:{b}").random() < 0.5
-        prompt = self.format_match_prompt(ctx, cand_a, cand_b, swap)
+        block1, block2 = self.format_match_blocks(ctx, cand_a, cand_b, swap)
 
-        model = resolve_model(self.model, "preference", ctx)
         try:
             output = await model.generate(
-                [ChatMessageUser(content=prompt)],
+                [two_block_user_message(block1, block2)],
                 config=GenerateConfig(max_tokens=self.max_tokens, cache_prompt=True),
             )
             text = output.completion or ""
@@ -129,6 +154,11 @@ class PairwiseSelector:
     async def select(self, ctx: TurnContext, candidates: list[Candidate]) -> Candidate:
         if len(candidates) == 1:
             return candidates[0]
+        model = resolve_model(self.model, "preference", ctx)
+        # Anthropic: complete one match per round before fanning out the rest,
+        # so parallel matches don't race a cold cache and all write the same
+        # shared prefix (writes bill at 1.25x; reads at 0.1x).
+        warm_first = is_anthropic_model(model)
         current = list(range(len(candidates)))
         round_no = 0
         while len(current) > 1:
@@ -138,10 +168,17 @@ class PairwiseSelector:
             async def resolve(a: int, b: int | None) -> int:
                 if b is None:
                     return a  # bye
-                return await self._play_match(ctx, candidates, a, b, round_no)
+                return await self._play_match(ctx, candidates, a, b, round_no, model)
 
+            warm_index = next(
+                (i for i, (_, b) in enumerate(pairs) if b is not None), 0
+            )
             current = list(
-                await asyncio.gather(*(resolve(a, b) for a, b in pairs))
+                await gather_warm_first(
+                    [lambda a=a, b=b: resolve(a, b) for a, b in pairs],
+                    warm_first=warm_first,
+                    warm_index=warm_index,
+                )
             )
         winner = candidates[current[0]]
         winner.details["pairwise_winner"] = True
