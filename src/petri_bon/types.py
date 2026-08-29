@@ -59,6 +59,47 @@ def resolve_model(spec: Any, role: str, ctx: TurnContext):
     return get_model(role=role)
 
 
+def is_anthropic_model(model: Any) -> bool:
+    """True when a resolved Inspect ``Model`` routes to the Anthropic provider.
+
+    Used to gate warm-first fan-out scheduling: Anthropic bills prompt-cache
+    writes at 1.25x, so racing parallel calls against a cold cache makes every
+    call write the same shared prefix. OpenAI and Gemini cache writes are
+    free, so those providers keep plain parallel fan-out. Duck-typed test
+    fakes (no ``api``) are not Anthropic.
+    """
+    api = getattr(model, "api", None)
+    return api is not None and "anthropic" in type(api).__module__
+
+
+async def gather_warm_first(
+    factories: Sequence[Any],
+    warm_first: bool,
+    warm_index: int = 0,
+) -> list[Any]:
+    """Run a batch of coroutine factories, optionally completing one call
+    before fanning out the rest.
+
+    With ``warm_first=True`` the ``warm_index`` call runs to completion first
+    so it populates the provider's prompt cache with the batch's shared
+    prefix; the remaining calls then fan out in parallel and cache-read that
+    prefix instead of all cache-writing it (the cold-cache write race).
+    Results are returned in factory order regardless of scheduling.
+    """
+    import asyncio
+
+    if not warm_first or len(factories) <= 1:
+        return list(await asyncio.gather(*(f() for f in factories)))
+    warm_index = max(0, min(warm_index, len(factories) - 1))
+    results: list[Any] = [None] * len(factories)
+    results[warm_index] = await factories[warm_index]()
+    rest_idx = [i for i in range(len(factories)) if i != warm_index]
+    rest = await asyncio.gather(*(factories[i]() for i in rest_idx))
+    for i, r in zip(rest_idx, rest):
+        results[i] = r
+    return results
+
+
 @dataclass
 class Candidate:
     """A single candidate auditor action, possibly refined across rounds."""

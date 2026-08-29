@@ -39,12 +39,35 @@ from ..types import (
     Candidate,
     TurnContext,
     format_preference_band,
+    gather_warm_first,
+    is_anthropic_model,
+    resolve_model,
 )
 from ..validation import validate_candidate
 
 logger = logging.getLogger(__name__)
 
 STORE_KEY = "petri_bon:turns"
+
+
+def _uses_anthropic(provider: object, role: str, ctx: TurnContext) -> bool:
+    """Whether a scorer/feedback provider's model routes to Anthropic.
+
+    Gates warm-first fan-out scheduling (Anthropic bills prompt-cache writes
+    at 1.25x; OpenAI/Gemini writes are free). A raw-Anthropic-client provider
+    (LogprobScorer) is Anthropic by construction; otherwise resolve the
+    provider's ``model`` spec the same way the provider itself will.
+    """
+    if provider is None:
+        return False
+    if hasattr(provider, "client"):  # raw Anthropic client (LogprobScorer)
+        return True
+    try:
+        return is_anthropic_model(
+            resolve_model(getattr(provider, "model", None), role, ctx)
+        )
+    except Exception:
+        return False
 
 
 def bon_generate(
@@ -121,8 +144,8 @@ def bon_generate(
             )
             return Candidate(message=output.message, output=output, round=0, index=index)
 
-        async def prepare(cand: Candidate) -> Candidate:
-            """Validate and (when a pointwise scorer exists) score a candidate."""
+        def validate_and_render(cand: Candidate) -> Candidate:
+            """Validate a candidate and render its target-visible transcript."""
             ok, err = validate_candidate(cand.message, ctx.target_messages)
             if not ok:
                 cand.structural_error = err
@@ -131,32 +154,67 @@ def bon_generate(
             cand.details["transcript"] = render_target_transcript(
                 ctx.target_messages, cand.message
             )
-            if scorer is not None and cand.score is None:
-                if not target_visible_calls(cand.message):
-                    cand.score = UNSCORABLE_SENTINEL
-                else:
-                    try:
-                        await scorer.score(ctx, cand)
-                    except Exception as e:
-                        # Auth/permission errors will never succeed on retry;
-                        # failing loudly beats silently scoring every
-                        # candidate 0.5 for the whole run.
-                        status = getattr(e, "status_code", None)
-                        if status in (400, 401, 403):
-                            raise RuntimeError(
-                                f"Preference scoring failed permanently "
-                                f"(HTTP {status}): {e}. For selector=logprob "
-                                f"this usually means the API key lacks the "
-                                f"probabilities-2024-07-31 beta (set "
-                                f"ANTHROPIC_API_KEY_LP), or the key is invalid."
-                            ) from e
-                        logger.error("Scoring error (turn %d): %s", turn, e)
-                        cand.score = 0.5
             return cand
+
+        async def score_candidate(cand: Candidate) -> Candidate:
+            """Score a validated candidate when a pointwise scorer exists."""
+            if scorer is None or cand.score is not None:
+                return cand
+            if not target_visible_calls(cand.message):
+                cand.score = UNSCORABLE_SENTINEL
+                return cand
+            try:
+                await scorer.score(ctx, cand)
+            except Exception as e:
+                # Auth/permission errors will never succeed on retry;
+                # failing loudly beats silently scoring every
+                # candidate 0.5 for the whole run.
+                status = getattr(e, "status_code", None)
+                if status in (400, 401, 403):
+                    raise RuntimeError(
+                        f"Preference scoring failed permanently "
+                        f"(HTTP {status}): {e}. For selector=logprob "
+                        f"this usually means the API key lacks the "
+                        f"probabilities-2024-07-31 beta (set "
+                        f"ANTHROPIC_API_KEY_LP), or the key is invalid."
+                    ) from e
+                logger.error("Scoring error (turn %d): %s", turn, e)
+                cand.score = 0.5
+            return cand
+
+        def scoreable_index(cands: list[Candidate]) -> int:
+            """First candidate whose scoring will actually call the model."""
+            return next(
+                (
+                    i
+                    for i, c in enumerate(cands)
+                    if c.structural_error is None
+                    and c.score is None
+                    and target_visible_calls(c.message)
+                ),
+                0,
+            )
+
+        # Anthropic warm-first gates for the scorer / feedback fan-outs (see
+        # gather_warm_first: one call completes first so parallel calls
+        # cache-read the shared prefix instead of racing a cold cache).
+        scorer_warm = _uses_anthropic(scorer, "preference", ctx)
+        feedback_warm = _uses_anthropic(feedback, "feedback", ctx)
+
+        async def prepare(cand: Candidate) -> Candidate:
+            """Validate and (when a pointwise scorer exists) score a candidate."""
+            return await score_candidate(validate_and_render(cand))
 
         # Round 0: n_samples parallel drafts, each starting its own chain.
         originals = await asyncio.gather(*(draft(i) for i in range(n_samples)))
-        originals = list(await asyncio.gather(*(prepare(c) for c in originals)))
+        originals = [validate_and_render(c) for c in originals]
+        originals = list(
+            await gather_warm_first(
+                [lambda c=c: score_candidate(c) for c in originals],
+                warm_first=scorer_warm,
+                warm_index=scoreable_index(originals),
+            )
+        )
         fallback = originals[0]
 
         chains: list[list[Candidate]] = [[c] for c in originals]
@@ -164,10 +222,34 @@ def bon_generate(
 
         for round_num in range(1, rounds + 1):
 
+            # Critique batch first (warm-first), then refinements: the
+            # feedback calls of a round share a cacheable prompt prefix, so
+            # they run as their own batch instead of racing inside the
+            # per-chain refine coroutines.
+            async def critique_chain(i: int) -> str:
+                assert feedback is not None
+                return await feedback.critique(ctx, chains[i][-1], chains[i][:-1])
+
+            # Warm with a chain whose critique will actually call the model
+            # (structurally invalid candidates get the templated structural
+            # feedback without one).
+            critique_warm_index = next(
+                (
+                    i
+                    for i in range(len(chains))
+                    if chains[i][-1].structural_error is None
+                ),
+                0,
+            )
+            feedback_texts = await gather_warm_first(
+                [lambda i=i: critique_chain(i) for i in range(len(chains))],
+                warm_first=feedback_warm,
+                warm_index=critique_warm_index,
+            )
+
             async def refine_chain(i: int) -> Candidate:
                 cand = chains[i][-1]
-                assert feedback is not None
-                feedback_text = await feedback.critique(ctx, cand, chains[i][:-1])
+                feedback_text = feedback_texts[i]
 
                 wm = working[i]
                 wm.append(cand.message)

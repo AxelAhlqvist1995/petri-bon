@@ -9,12 +9,18 @@ from typing import Protocol, runtime_checkable
 from inspect_ai.model import (
     ChatMessageAssistant,
     ChatMessageUser,
+    ContentText,
     GenerateConfig,
     Model,
 )
 
 from .prompts.loader import load_prompt, resolve_prompt
-from .rendering import render_last_action
+from .rendering import (
+    render_last_action,
+    render_target_transcript,
+    split_at_shared_prefix,
+    two_block_user_message,
+)
 from .types import Candidate, TurnContext, format_preference_band, resolve_model
 
 logger = logging.getLogger(__name__)
@@ -119,22 +125,47 @@ class DefaultFeedbackModel:
         prompt_text = self._format_prompt(ctx, candidate)
         model = resolve_model(self.model, "feedback", ctx)
         config = GenerateConfig(max_tokens=self.max_tokens, cache_prompt=True)
+        # Two-block cache packaging: split prompts at the end of the shared
+        # conversation (the transcript without the candidate's staged effects)
+        # so same-turn feedback calls cache-read that prefix instead of each
+        # cache-writing the whole prompt. Rendered text is byte-identical;
+        # when no valid split exists the legacy single-block packaging is kept.
+        shared = render_target_transcript(ctx.target_messages, None)
         try:
             if self.single_turn:
-                out = await model.generate(
-                    [ChatMessageUser(content=prompt_text)], config=config
+                split = split_at_shared_prefix(
+                    prompt_text, candidate.details.get("transcript"), shared
                 )
+                message = (
+                    two_block_user_message(*split)
+                    if split is not None
+                    else ChatMessageUser(content=prompt_text)
+                )
+                out = await model.generate([message], config=config)
             else:
-                # Turn 1: classification reasoning on the preference prompt.
-                out1 = await model.generate(
-                    [ChatMessageUser(content=preference_prompt)], config=config
+                split = split_at_shared_prefix(preference_prompt, None, shared)
+                preference_message = (
+                    two_block_user_message(*split)
+                    if split is not None
+                    else ChatMessageUser(content=preference_prompt)
                 )
+                # Turn 1: classification reasoning on the preference prompt.
+                out1 = await model.generate([preference_message], config=config)
                 classification = out1.completion or ""
-                # Turn 2: feedback anchored on that classification.
+                # Turn 2: feedback anchored on that classification. The
+                # classification is packaged as a content block (same rendered
+                # text) so the cache breakpoint can land on it and the Turn-2
+                # request cache-reads the Turn-1 prefix — a bare-string
+                # assistant message cannot carry cache_control.
+                classification_message = (
+                    ChatMessageAssistant(content=[ContentText(text=classification)])
+                    if classification and split is not None
+                    else ChatMessageAssistant(content=classification)
+                )
                 out = await model.generate(
                     [
-                        ChatMessageUser(content=preference_prompt),
-                        ChatMessageAssistant(content=classification),
+                        preference_message,
+                        classification_message,
                         ChatMessageUser(content=prompt_text),
                     ],
                     config=config,
